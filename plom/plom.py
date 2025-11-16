@@ -26,12 +26,17 @@ def initialize(training=None,
                scaling=True,
                scaling_method='Normalization',
                
+               attn_enabled=False,
+               attn_weights=None,
+               attn_alpha=1.0,
+               
                pca=True,
                pca_method='cum_energy',
                pca_cum_energy=1-1e-5,
                pca_eigv_cutoff=0,
                pca_dim=1,
                pca_scale_evecs=True,
+               pca_whiten=False,
                
                dmaps=True,
                dmaps_epsilon='auto',
@@ -77,13 +82,16 @@ def initialize(training=None,
     inp_params_dict['ito_steps']             = ito_steps
     inp_params_dict['ito_kde_bw_factor']     = ito_kde_bw_factor
     inp_params_dict['ito_num_samples']       = num_samples
+    inp_params_dict['attn_alpha']            = attn_alpha
     
     options_dict = dict()
     options_dict['scaling']           = scaling
     options_dict['scaling_method']    = scaling_method
+    options_dict['attn_enabled']      = attn_enabled
     options_dict['pca']               = pca   
     options_dict['pca_method']        = pca_method
     options_dict['pca_scale_evecs']   = pca_scale_evecs
+    options_dict['pca_whiten']        = pca_whiten
     options_dict['dmaps']             = dmaps
     options_dict['dmap_first_evec']   = dmaps_first_evec
     options_dict['dmaps_m_override']  = dmaps_m_override
@@ -120,6 +128,14 @@ def initialize(training=None,
     pca_dict['reconst_training'] = None
     pca_dict['augmented']        = None
     
+    attn_dict = dict()
+    attn_dict['weights']         = attn_weights
+    attn_dict['alpha']           = attn_alpha
+    attn_dict['precond_matrix']  = None
+    attn_dict['training']        = None
+    attn_dict['reconst_training'] = None
+    attn_dict['augmented']       = None
+    
     dmaps_dict = dict()
     dmaps_dict['training']      = None
     dmaps_dict['eigenvectors']  = None
@@ -149,6 +165,7 @@ def initialize(training=None,
     plom_dict['input']    = inp_params_dict
     plom_dict['options']  = options_dict
     plom_dict['scaling']  = scaling_dict
+    plom_dict['attn']     = attn_dict
     plom_dict['pca']      = pca_dict
     plom_dict['dmaps']    = dmaps_dict
     plom_dict['ito']      = ito_dict
@@ -332,6 +349,51 @@ def scale(plom_dict):
     plom_dict['scaling']['training'] = scaled_train
     plom_dict['scaling']['centers']  = centers
     plom_dict['scaling']['scales']   = scales
+
+###############################################################################
+def _scaleRobust(X, verbose=True):
+    """
+    Robust scaling of dataset X using median and interquartile range (IQR).
+    
+    Data is centered at the median and scaled by the IQR. This is more robust
+    to outliers than standard scaling. If any dimensions have zero IQR, then
+    set that scale to 1.
+
+    Parameters
+    ----------
+    X : ndarray of shape (n_samples, n_features)
+        Input data that will be scaled.
+    
+    verbose : bool, optional
+        If True, print relevant information. The default is True.
+
+    Returns
+    -------
+    X_scaled : ndarray of shape (n_samples, n_features)
+        Scaled data.
+    
+    centers : ndarray of shape (n_features, )
+        Medians of individual features.
+    
+    scales : ndarray of shape (n_features, )
+        Interquartile ranges of individual features.
+
+    """
+    if verbose:
+        print("\n\nScaling data (robust).")
+        print("---------------------")
+        print("Input data dimensions:", X.shape)
+        print("Using 'Robust' scaler (median/IQR).")
+
+    centers = np.median(X, axis=0)
+    q75 = np.percentile(X, 75, axis=0)
+    q25 = np.percentile(X, 25, axis=0)
+    scales = q75 - q25
+    scales[scales == 0] = 1
+    X_scaled = (X - centers) / scales
+    if verbose:
+        print("Output data dimensions:", X_scaled.shape)
+    return X_scaled, centers, scales
 
 ###############################################################################
 def _inverse_scale(X, centers, scales, verbose=True):
@@ -635,6 +697,257 @@ def inverse_pca(plom_dict):
             plom_dict['scaling']['augmented'] = X
         else:
             plom_dict['data']['augmented'] = X
+
+###############################################################################
+def _attn_precondition(X, weights, alpha, verbose=True):
+    """
+    Apply attention-based preconditioning to scaled data.
+    
+    Given weight vector w and exponent alpha in [0.5, 1], compute the 
+    preconditioning matrix S = diag((w^alpha)^{1/2}) and apply it to X.
+    
+    Parameters
+    ----------
+    X : ndarray of shape (n_samples, n_features)
+        Input scaled data.
+    
+    weights : ndarray of shape (n_features,)
+        Attention weight vector w.
+    
+    alpha : float in [0.5, 1]
+        Exponent parameter controlling the strength of attention weighting.
+    
+    verbose : bool, optional
+        If True, print relevant information. The default is True.
+
+    Returns
+    -------
+    X_attn : ndarray of shape (n_samples, n_features)
+        Attention-preconditioned data.
+    
+    S : ndarray of shape (n_features, n_features)
+        Preconditioning matrix S = diag((w^alpha)^{1/2}).
+
+    """
+    if verbose:
+        print("\n\nApplying attention preconditioning.")
+        print("----------------------------------")
+        print("Input data dimensions:", X.shape)
+        print(f"Attention exponent alpha: {alpha:.4f}")
+        
+    # Compute w^alpha
+    w_alpha = np.power(weights, alpha)
+    
+    # Compute S = diag((w^alpha)^{1/2})
+    s_diag = np.sqrt(w_alpha)
+    S = np.diag(s_diag)
+    
+    # Apply S to X: X_attn = X @ S^T (since X is n_samples x n_features)
+    X_attn = X @ S.T
+    
+    if verbose:
+        print("Output data dimensions:", X_attn.shape)
+        print("Attention preconditioning complete.")
+    
+    return X_attn, S
+
+###############################################################################
+def attn_precondition(plom_dict):
+    """
+    PLoM wrapper for attention preconditioning function.
+
+    Parameters
+    ----------
+    plom_dict : dictionary
+        PLoM dictionary containing all elements computed by the PLoM framework.
+        The relevant dictionary key gets updated by this function.
+
+    Returns
+    -------
+    None.
+
+    """
+    X = plom_dict['scaling']['training']
+    weights = plom_dict['attn']['weights']
+    alpha = plom_dict['input']['attn_alpha']
+    verbose = plom_dict['options']['verbose']
+    
+    if weights is None:
+        if verbose:
+            print("\n\nWarning: Attention weights not provided. Using uniform weights.")
+        weights = np.ones(X.shape[1])
+    
+    X_attn, S = _attn_precondition(X, weights, alpha, verbose)
+    
+    plom_dict['attn']['training'] = X_attn
+    plom_dict['attn']['precond_matrix'] = S
+
+###############################################################################
+def _inverse_attn_precondition(X_attn, S, verbose=True):
+    """
+    Inverse of attention preconditioning.
+    
+    Given preconditioned data X_attn and preconditioning matrix S, recover
+    the original scaled data: X = X_attn @ S^{-T}.
+
+    Parameters
+    ----------
+    X_attn : ndarray of shape (n_samples, n_features)
+        Attention-preconditioned data.
+    
+    S : ndarray of shape (n_features, n_features)
+        Preconditioning matrix S = diag((w^alpha)^{1/2}).
+    
+    verbose : bool, optional
+        If True, print relevant information. The default is True.
+
+    Returns
+    -------
+    X : ndarray of shape (n_samples, n_features)
+        Recovered scaled data.
+
+    """
+    S_inv = np.linalg.inv(S)
+    X = X_attn @ S_inv.T
+    return X
+
+###############################################################################
+def inverse_attn_precondition(plom_dict):
+    """
+    PLoM wrapper for inverse attention preconditioning function.
+
+    Parameters
+    ----------
+    plom_dict : dictionary
+        PLoM dictionary containing all elements computed by the PLoM framework.
+        The relevant dictionary key gets updated by this function.
+
+    Returns
+    -------
+    None.
+
+    """
+    S = plom_dict['attn']['precond_matrix']
+    verbose = plom_dict['options']['verbose']
+    
+    reconst_training = plom_dict['attn']['reconst_training']
+    augmented = plom_dict['attn']['augmented']
+    
+    if reconst_training is not None:
+        X = _inverse_attn_precondition(reconst_training, S, verbose)
+        plom_dict['scaling']['reconst_training'] = X
+    
+    if augmented is not None:
+        X = _inverse_attn_precondition(augmented, S, verbose)
+        plom_dict['scaling']['augmented'] = X
+
+###############################################################################
+def _pca_whiten(X, verbose=True):
+    """
+    PCA whitening (full-rank whitening) of data.
+    
+    Performs eigendecomposition of empirical covariance, and returns whitened
+    data such that the whitened covariance is identity. For r = n_features,
+    this includes all variance information.
+    
+    Parameters
+    ----------
+    X : ndarray of shape (n_samples, n_features)
+        Input data to whiten.
+    
+    verbose : bool, optional
+        If True, print relevant information. The default is True.
+
+    Returns
+    -------
+    eta_d : ndarray of shape (n_samples, n_features)
+        Whitened data: eta_d = X @ Phi @ Lambda^{-1/2}.
+    
+    Phi_r : ndarray of shape (n_features, n_features)
+        Eigenvectors of the covariance matrix (full rank).
+    
+    Lambda_r : ndarray of shape (n_features,)
+        Eigenvalues of the covariance matrix (full rank).
+    
+    mean : ndarray of shape (n_features,)
+        Mean of the input data.
+
+    """
+    if verbose:
+        print("\n\nPCA whitening (full-rank).")
+        print("------------------------")
+        print("Input data dimensions:", X.shape)
+    
+    # Center the data
+    mean = np.mean(X, axis=0)
+    X_centered = X - mean
+    
+    # Compute covariance matrix
+    C = np.cov(X_centered.T)
+    
+    # Eigendecomposition: C = Phi @ Lambda @ Phi^T
+    Lambda, Phi = np.linalg.eigh(C)
+    
+    # Sort by eigenvalues in descending order
+    idx = np.argsort(Lambda)[::-1]
+    Lambda = Lambda[idx]
+    Phi = Phi[:, idx]
+    
+    # For full rank, keep all components
+    n_features = X.shape[1]
+    Phi_r = Phi[:, :n_features]
+    Lambda_r = Lambda[:n_features]
+    
+    # Whiten: eta_d = (X - mean) @ Phi @ Lambda^{-1/2}
+    Lambda_r_inv_sqrt = 1.0 / np.sqrt(Lambda_r + 1e-10)  # Add small epsilon for numerical stability
+    eta_d = X_centered @ Phi_r @ np.diag(Lambda_r_inv_sqrt)
+    
+    if verbose:
+        print("Output (whitened) dimensions:", eta_d.shape)
+        print(f"Eigenvalue range: [{Lambda_r[-1]:.6e}, {Lambda_r[0]:.6e}]")
+        print("PCA whitening complete.")
+    
+    return eta_d, Phi_r, Lambda_r, mean
+
+###############################################################################
+def _inverse_pca_whiten(eta_d, Phi_r, Lambda_r, mean, verbose=True):
+    """
+    Inverse of PCA whitening.
+    
+    Given whitened data eta_d and the transformation parameters, recover
+    the original (unwhitened) data.
+
+    Parameters
+    ----------
+    eta_d : ndarray of shape (n_samples, n_features)
+        Whitened data.
+    
+    Phi_r : ndarray of shape (n_features, n_features)
+        Eigenvectors matrix.
+    
+    Lambda_r : ndarray of shape (n_features,)
+        Eigenvalues.
+    
+    mean : ndarray of shape (n_features,)
+        Mean of the original data.
+    
+    verbose : bool, optional
+        If True, print relevant information. The default is True.
+
+    Returns
+    -------
+    X : ndarray of shape (n_samples, n_features)
+        Recovered (unwhitened) data.
+
+    """
+    # Reverse whitening: X_centered = eta_d @ Lambda_r^{1/2} @ Phi_r^T
+    Lambda_r_sqrt = np.sqrt(Lambda_r + 1e-10)
+    X_centered = eta_d @ np.diag(Lambda_r_sqrt) @ Phi_r.T
+    
+    # Uncenter
+    X = X_centered + mean
+    
+    return X
 
 ###############################################################################
 def _sample_projection(H, g):
@@ -2173,7 +2486,9 @@ def run(plom_dict):
     
     verbose        = options['verbose']
     scaling_opt    = options['scaling']
+    attn_opt       = options['attn_enabled']
     pca_opt        = options['pca']
+    pca_whiten_opt = options['pca_whiten']
     dmaps_opt      = options['dmaps']
     projection_opt = options['projection']
     sampling_opt   = options['sampling']
@@ -2183,14 +2498,49 @@ def run(plom_dict):
     
     if verbose:
         print(f"\nPLoM run starting at {str(datetime.now()).split('.')[0]}")
+        if attn_opt:
+            print("** Option A: Attention-informed workflow **")
 
-## Scaling
+## Scaling (robust or standard)
     if scaling_opt:
-        scale(plom_dict)
+        if attn_opt and options['scaling_method'] == 'RobustIQR':
+            # For Option A, use robust scaling
+            training = plom_dict['data']['training']
+            scaled_train, centers, scales = _scaleRobust(training, verbose)
+            plom_dict['scaling']['training'] = scaled_train
+            plom_dict['scaling']['centers'] = centers
+            plom_dict['scaling']['scales'] = scales
+        else:
+            scale(plom_dict)
 
-## PCA
+## Attention preconditioning
+    if attn_opt:
+        attn_precondition(plom_dict)
+        # For Option A, PCA is applied to attention-preconditioned data
+        pca_input = plom_dict['attn']['training']
+        plom_dict['pca']['_input_source'] = 'attn'
+    else:
+        pca_input = plom_dict['scaling']['training']
+        plom_dict['pca']['_input_source'] = 'scaling'
+
+## PCA / PCA Whitening
     if pca_opt:
-        pca(plom_dict)
+        if pca_whiten_opt:
+            # Full-rank whitening for Option A
+            if attn_opt:
+                X = plom_dict['attn']['training']
+            else:
+                X = plom_dict['scaling']['training']
+            
+            eta_d, Phi_r, Lambda_r, mean = _pca_whiten(X, verbose)
+            plom_dict['pca']['training'] = eta_d
+            plom_dict['pca']['evecs'] = Phi_r
+            plom_dict['pca']['eigvals'] = Lambda_r
+            plom_dict['pca']['mean'] = mean
+            plom_dict['pca']['eigvals_trunc'] = Lambda_r
+        else:
+            # Standard PCA
+            pca(plom_dict)
 
 ## DMAPS
     if dmaps_opt:
@@ -2208,9 +2558,35 @@ def run(plom_dict):
     if projection_opt:
         inverse_sample_projection(plom_dict)
 
-## Inverse PCA
+## Inverse PCA / PCA Whitening
     if pca_opt:
-        inverse_pca(plom_dict)
+        if pca_whiten_opt:
+            # Inverse whitening for Option A
+            eta_d_reconst = plom_dict['pca']['reconst_training']
+            eta_d_augment = plom_dict['pca']['augmented']
+            Phi_r = plom_dict['pca']['evecs']
+            Lambda_r = plom_dict['pca']['eigvals']
+            mean = plom_dict['pca']['mean']
+            
+            if eta_d_reconst is not None:
+                X_reconst = _inverse_pca_whiten(eta_d_reconst, Phi_r, Lambda_r, mean, verbose)
+                if attn_opt:
+                    plom_dict['attn']['reconst_training'] = X_reconst
+                else:
+                    plom_dict['scaling']['reconst_training'] = X_reconst
+            
+            if eta_d_augment is not None:
+                X_augment = _inverse_pca_whiten(eta_d_augment, Phi_r, Lambda_r, mean, verbose)
+                if attn_opt:
+                    plom_dict['attn']['augmented'] = X_augment
+                else:
+                    plom_dict['scaling']['augmented'] = X_augment
+        else:
+            inverse_pca(plom_dict)
+
+## Inverse attention preconditioning
+    if attn_opt:
+        inverse_attn_precondition(plom_dict)
 
 ## Inverse scaling
     if scaling_opt:
