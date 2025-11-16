@@ -28,6 +28,7 @@ def initialize(training=None,
                
                attn_enabled=False,
                attn_weights=None,
+               attn_weights_file=None,
                attn_alpha=1.0,
                
                pca=True,
@@ -127,6 +128,16 @@ def initialize(training=None,
     pca_dict['eigvals_trunc']    = None
     pca_dict['reconst_training'] = None
     pca_dict['augmented']        = None
+    
+    # Load attention weights from file if provided
+    if attn_weights_file is not None:
+        try:
+            attn_weights = np.loadtxt(attn_weights_file, delimiter=',')
+            # Handle both 1D and 2D arrays (1x285 or 285x1)
+            if attn_weights.ndim > 1:
+                attn_weights = attn_weights.flatten()
+        except Exception as e:
+            raise ValueError(f"Failed to load attention weights from '{attn_weights_file}': {e}")
     
     attn_dict = dict()
     attn_dict['weights']         = attn_weights
@@ -2302,10 +2313,14 @@ def make_summary(plom_dict):
         summary.append("DMAPS")
         summary.append(f"Input epsilon: {inputs['dmaps_epsilon']}")
         summary.append(f"Used epsilon: {dmaps['epsilon']:.2f}")
+        
+        # Handle edge case where dimension is at the boundary of eigenvalues array
+        eig_display_end = min(dmaps['dimension']+1, len(dmaps['eigenvalues'])-1)
         summary.append("DMAPS eigenvalues: " +
-                       f"{dmaps['eigenvalues'][1:dmaps['dimension']+1]}" + 
-                       f" [{dmaps['eigenvalues'][dmaps['dimension']+1]:.4f}"+
-                       " ...]")
+                       f"{dmaps['eigenvalues'][1:eig_display_end+1]}")
+        if eig_display_end < len(dmaps['eigenvalues'])-1:
+            summary.append(f" [{dmaps['eigenvalues'][eig_display_end+1]:.4f} ...]")
+        
         summary.append(f"Manifold dimension = {dmaps['dimension']}")
         summary.append(f"Used {dmaps['reduced_basis'].shape[1]} eigenvectors" +
                        " for projection.")

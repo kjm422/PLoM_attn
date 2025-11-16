@@ -1,0 +1,29 @@
+Job Summary
+-----------
+Job: CSV weights workflow
+
+Training data dimensions: (100, 285)
+
+Scaling
+Used 'RobustIQR' method for scaling.
+
+PCA
+Used Cumulative Energy Content criteria for PCA.
+PCA features reduction: 285 -> 285
+
+DMAPS
+Input epsilon: auto
+Used epsilon: 0.10
+DMAPS eigenvalues: [nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan
+ nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan
+ nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan
+ nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan
+ nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan
+ nan nan nan nan nan nan nan nan nan]
+Manifold dimension = 99
+Used 99 eigenvectors for projection.
+Projected data (Z) dimensions: (100, 99)
+
+Sampling
+Generated 2 samples.
+Augmented data dimensions: (200, 285)
