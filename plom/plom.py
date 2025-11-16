@@ -156,6 +156,8 @@ def initialize(training=None,
     dmaps_dict['basis']         = None
     dmaps_dict['reduced_basis'] = None
     dmaps_dict['eps_vs_m']      = None
+    dmaps_dict['metric_matrix'] = None
+    dmaps_dict['R']             = None
     
     ito_dict = dict()
     ito_dict['Z0']            = None
@@ -1015,7 +1017,307 @@ def inverse_sample_projection(plom_dict):
     else:
         plom_dict['data']['augmented'] = X_augmented
         plom_dict['data']['reconst_training'] = X_reconst
+
+###############################################################################
+def _compute_metric_matrix(attn_weights, attn_alpha, eigvals, eigvecs, verbose=True):
+    """
+    Compute the attention-informed metric matrix in whitened space.
+    
+    Given band-space attention weights w and exponent α, compute the metric
+    in the whitened PCA space via:
+        M_η = Λ_r^{1/2} Φ_r^T M_x Φ_r Λ_r^{1/2}
+    where M_x = diag(w^α) in band space.
+    
+    Parameters
+    ----------
+    attn_weights : ndarray of shape (n_features,)
+        Attention weight vector w in band space.
+    
+    attn_alpha : float in [0.5, 1]
+        Exponent α controlling attention strength.
+    
+    eigvals : ndarray of shape (n_features,)
+        Eigenvalues from PCA (Λ).
+    
+    eigvecs : ndarray of shape (n_features, r)
+        Eigenvectors from PCA (Φ_r).
+    
+    verbose : bool, optional
+        If True, print relevant information. The default is True.
+
+    Returns
+    -------
+    M_eta : ndarray of shape (r, r)
+        Metric matrix in whitened space.
+    
+    R : ndarray of shape (r, r)
+        Cholesky factor such that M_eta = R^T @ R.
+
+    """
+    if verbose:
+        print("\n\nComputing attention-informed metric matrix.")
+        print("-------------------------------------------")
+        print(f"Attention weights: shape {attn_weights.shape}")
+        print(f"Eigenvectors: shape {eigvecs.shape}")
+        print(f"Eigenvalues: shape {eigvals.shape}")
+    
+    # M_x = diag(w^α) in band space
+    w_alpha = np.power(attn_weights, attn_alpha)
+    M_x = np.diag(w_alpha)
+    
+    # Lambda_r^{1/2}
+    Lambda_sqrt = np.sqrt(eigvals + 1e-10)
+    
+    # M_η = Λ_r^{1/2} Φ_r^T M_x Φ_r Λ_r^{1/2}
+    M_eta = (np.diag(Lambda_sqrt) @ eigvecs.T @ M_x @ eigvecs @ np.diag(Lambda_sqrt))
+    
+    # Ensure symmetry (numerical precision)
+    M_eta = 0.5 * (M_eta + M_eta.T)
+    
+    # Compute Cholesky factor: M_eta = R^T @ R
+    try:
+        R = np.linalg.cholesky(M_eta)
+        R = R.T  # Cholesky gives lower triangular, we want upper for distance computation
+        if verbose:
+            print(f"Metric matrix condition number: {np.linalg.cond(M_eta):.4e}")
+            print(f"Cholesky factor computed successfully")
+    except np.linalg.LinAlgError:
+        if verbose:
+            print("Warning: Metric matrix not positive definite, using eigenvalue decomposition")
+        # Fallback: use eigenvalue decomposition
+        evals, evecs = np.linalg.eigh(M_eta)
+        evals = np.maximum(evals, 1e-10)  # Ensure positive
+        R = (evecs @ np.diag(np.sqrt(evals))).T
+    
+    return M_eta, R
+
+###############################################################################
+def _get_dmaps_basis_anisotropic(H, epsilon, M_eta, R=None, kappa=1, verbose=True):
+    """
+    Compute DMAPS basis using anisotropic (attention-informed) kernel.
+    
+    Uses the metric M_η to compute pairwise distances:
+        d²(η_i, η_j) = (η_i - η_j)^T M_η (η_i - η_j)
+                     = ||R(η_i - η_j)||²  if R = Cholesky factor
+    
+    Parameters
+    ----------
+    H : ndarray of shape (n_samples, m)
+        Whitened data in reduced space (already in whitened coordinates).
+    
+    epsilon : float
+        Diffusion kernel bandwidth.
+    
+    M_eta : ndarray of shape (m, m)
+        Attention-informed metric matrix in whitened space.
+    
+    R : ndarray of shape (m, m), optional
+        Cholesky factor of M_eta such that M_eta = R^T @ R.
+        If None, will be computed from M_eta.
+    
+    kappa : int, optional (default is 1)
+        Power parameter for diffusion operator.
+    
+    verbose : bool, optional
+        If True, print relevant information.
+
+    Returns
+    -------
+    basis : ndarray of shape (n_samples, n_samples)
+        DMAPS basis vectors [g] with anisotropic kernel.
+    
+    eigenvalues : ndarray of shape (n_samples,)
+        DMAPS eigenvalues.
+    
+    eigenvectors : ndarray of shape (n_samples, n_samples)
+        DMAPS eigenvectors.
+
+    """
+    if verbose:
+        print("Computing DMAPS with anisotropic kernel...")
+    
+    if R is None:
+        # Compute Cholesky if not provided
+        R = np.linalg.cholesky(M_eta).T
+    
+    # Compute transformed distances: d²_M = (η_i - η_j)^T M_η (η_i - η_j)
+    # Using Cholesky: d²_M = ||R(η_i - η_j)||²
+    H_transformed = H @ R.T
+    distances_sq = distance_matrix(H_transformed, H_transformed, p=2) ** 2
+    
+    # Construct kernel: K_ij = exp(-d²_M / (4ε))
+    K = np.exp(-distances_sq / (4 * epsilon))
+    
+    # Normalize: P_S = b^{-1/2} K b^{-1/2} where b = diag(sum_j K_ij)
+    b = np.sum(K, axis=1)
+    b_inv_sqrt = 1.0 / np.sqrt(b + 1e-10)
+    P_S = (K * b_inv_sqrt[:, None]) * b_inv_sqrt[None, :]
+    
+    # Eigendecompose
+    eigenvalues, eigenvectors = np.linalg.eigh(P_S)
+    
+    # Basis vectors with kappa power
+    basis_vectors = eigenvectors / b_inv_sqrt[:, None]
+    basis = basis_vectors * (eigenvalues[None, :] ** kappa)
+    
+    # Sort in descending order
+    idx = np.argsort(-eigenvalues)
+    
+    if verbose:
+        print(f"Anisotropic kernel eigenvalues (top 5): {eigenvalues[idx[:5]]}")
+    
+    return basis[:, idx], eigenvalues[idx], eigenvectors[:, idx]
+
+###############################################################################
+def _get_dmaps_basis_anisotropic_wrapper(X, epsilon, kappa, L, first_evec, m_override,
+                                         M_eta, R, dist_method, verbose=True):
+    """
+    Wrapper for anisotropic DMAPS that handles epsilon optimization and returns
+    results in the same format as _dmaps().
+    
+    Parameters
+    ----------
+    X : ndarray of shape (n_samples, m)
+        Whitened data in manifold space.
+    
+    epsilon : float or 'auto'
+        Diffusion kernel bandwidth.
+    
+    kappa : int
+        Power parameter for diffusion operator.
+    
+    L : float
+        DMAPS eigenvalue cutoff for dimension selection.
+    
+    first_evec : bool
+        If True, include first eigenvector.
+    
+    m_override : int
+        If > 0, override automatic dimension selection.
+    
+    M_eta : ndarray of shape (m, m)
+        Attention-informed metric matrix.
+    
+    R : ndarray of shape (m, m)
+        Cholesky factor of M_eta.
+    
+    dist_method : str
+        Distance method (not used for anisotropic, kept for consistency).
+    
+    verbose : bool
+        If True, print information.
+
+    Returns
+    -------
+    red_basis : ndarray of shape (n_samples, m_red)
+        Reduced DMAPS basis.
+    
+    basis : ndarray of shape (n_samples, n_samples)
+        Full DMAPS basis.
+    
+    epsilon : float
+        Kernel bandwidth used.
+    
+    m : int
+        Manifold dimension.
+    
+    eigvals : ndarray
+        DMAPS eigenvalues.
+    
+    eigvecs : ndarray
+        DMAPS eigenvectors.
+    
+    eps_vs_m : list
+        Epsilon vs dimension tracking.
+
+    """
+    if verbose:
+        print("\n\nPerforming DMAPS analysis with anisotropic kernel.")
+        print("---------------------------------------------------")
+        print("Input data dimensions:", X.shape)
+    
+    eps_vs_m = []
+    
+    if epsilon == 'auto':
+        # For anisotropic, we use a simple heuristic approach
+        # Try a range of epsilons and pick one that gives reasonable m
+        if verbose:
+            print("Finding best epsilon for anisotropic DMAPS (heuristic).")
         
+        # Try several epsilon values (log-spaced)
+        eps_candidates = np.logspace(-2, 2, 20)
+        
+        for eps_test in eps_candidates:
+            basis, eigvals, eigvecs = _get_dmaps_basis_anisotropic(
+                X, eps_test, M_eta, R, kappa, verbose=False
+            )
+            m_test = _get_dmaps_optimal_dimension_from_eigenvalues(eigvals, L)
+            eps_vs_m.append([eps_test, m_test])
+        
+        eps_vs_m = np.array(eps_vs_m)
+        
+        # Select epsilon that gives smallest reasonable manifold dimension
+        dims = eps_vs_m[:, 1]
+        best_idx = np.argmin(dims)
+        epsilon = eps_vs_m[best_idx, 0]
+        m_opt = int(eps_vs_m[best_idx, 1])
+        
+        if verbose:
+            print(f"Optimal epsilon (anisotropic): {epsilon:.4f}")
+            print(f"Manifold dimension (m_opt): {m_opt}")
+    else:
+        eps_vs_m = []
+        m_opt = None
+    
+    # Compute final DMAPS basis with selected epsilon
+    basis, eigvals, eigvecs = _get_dmaps_basis_anisotropic(
+        X, epsilon, M_eta, R, kappa, verbose=verbose
+    )
+    
+    # Determine manifold dimension
+    m = _get_dmaps_optimal_dimension_from_eigenvalues(eigvals, L)
+    if m_override > 0:
+        m = m_override
+    
+    if verbose:
+        print(f"Manifold eigenvalues: {str(eigvals[1:m+2])[1:-1]} [...]")
+        if m_opt is not None:
+            print(f"Manifold dimension: m optimal = {m_opt}")
+        if m_override > 0:
+            print("Overriding manifold dimension.")
+        print(f"m used = {m}")
+    
+    # Construct reduced basis
+    if first_evec:
+        red_basis = basis[:, :m+1]
+    else:
+        red_basis = basis[:, 1:m+1]
+    
+    return red_basis, basis, epsilon, m, eigvals, eigvecs, eps_vs_m
+
+###############################################################################
+def _get_dmaps_optimal_dimension_from_eigenvalues(eigvals, L):
+    """
+    Determine manifold dimension from eigenvalue cutoff.
+    
+    Parameters
+    ----------
+    eigvals : ndarray
+        Eigenvalues in descending order.
+    
+    L : float
+        Cutoff ratio.
+
+    Returns
+    -------
+    m : int
+        Manifold dimension.
+    """
+    for i in range(1, len(eigvals) - 1):
+        if eigvals[i] / eigvals[i+1] > L:
+            return i
+    return len(eigvals) - 2
+
 ###############################################################################
 def _get_dmaps_basis(H, epsilon, kappa=1, diffusion_dist_method='standard'):
     """
@@ -1409,6 +1711,7 @@ def dmaps(plom_dict):
     m_override  = plom_dict['options']['dmaps_m_override']
     dist_method = plom_dict['options']['dmaps_dist_method']
     verbose     = plom_dict['options']['verbose']
+    attn_enabled = plom_dict['options']['attn_enabled']
     
     if plom_dict['pca']['training'] is not None:
         X = plom_dict['pca']['training']
@@ -1417,9 +1720,30 @@ def dmaps(plom_dict):
     else:
         X = plom_dict['data']['training']
     
-    red_basis, basis, epsilon, m, eigvals, eigvecs, eps_vs_m = \
-        _dmaps(X, epsilon, kappa, L, first_evec, m_override, dist_method, 
-               verbose)
+    # Option B: Anisotropic kernel based on attention weights
+    if attn_enabled and plom_dict['attn']['weights'] is not None:
+        attn_weights = plom_dict['attn']['weights']
+        attn_alpha = plom_dict['attn']['alpha']
+        pca_eigvals = plom_dict['pca']['eigvals']
+        pca_eigvecs = plom_dict['pca']['evecs']
+        
+        # Compute metric matrix in whitened space
+        M_eta, R = _compute_metric_matrix(attn_weights, attn_alpha, pca_eigvals, 
+                                          pca_eigvecs, verbose)
+        
+        # Get DMAPS basis with anisotropic kernel
+        red_basis, basis, epsilon, m, eigvals, eigvecs, eps_vs_m = \
+            _get_dmaps_basis_anisotropic_wrapper(X, epsilon, kappa, L, first_evec, 
+                                                 m_override, M_eta, R, dist_method, 
+                                                 verbose)
+        
+        plom_dict['dmaps']['metric_matrix'] = M_eta
+        plom_dict['dmaps']['R'] = R
+    else:
+        # Standard DMAPS with isotropic kernel
+        red_basis, basis, epsilon, m, eigvals, eigvecs, eps_vs_m = \
+            _dmaps(X, epsilon, kappa, L, first_evec, m_override, dist_method, 
+                   verbose)
     
     plom_dict['dmaps']['eigenvectors']  = eigvecs
     plom_dict['dmaps']['eigenvalues']   = eigvals
@@ -2406,12 +2730,15 @@ def run(plom_dict):
     if verbose:
         print(f"\nPLoM run starting at {str(datetime.now()).split('.')[0]}")
         if attn_opt:
-            print("** Option A: Attention-informed workflow **")
+            if pca_whiten_opt:
+                print("** Option B: Attention-informed anisotropic kernel workflow **")
+            else:
+                print("** Option A: Attention preconditioning + standard kernel workflow **")
 
 ## Scaling (robust or standard)
     if scaling_opt:
         if attn_opt and options['scaling_method'] == 'RobustIQR':
-            # For Option A, use robust scaling
+            # For Options A and B, use robust scaling
             training = plom_dict['data']['training']
             scaled_train, centers, scales = _scaleRobust(training, verbose)
             plom_dict['scaling']['training'] = scaled_train
@@ -2420,24 +2747,23 @@ def run(plom_dict):
         else:
             scale(plom_dict)
 
-## Attention preconditioning
-    if attn_opt:
+## Attention preconditioning (Option A only)
+    if attn_opt and not pca_whiten_opt:
+        # Option A: Apply attention preconditioning in band space before PCA
         attn_precondition(plom_dict)
-        # For Option A, PCA is applied to attention-preconditioned data
         pca_input = plom_dict['attn']['training']
         plom_dict['pca']['_input_source'] = 'attn'
     else:
+        # Option B: No band-space preconditioning; attention handled by anisotropic kernel
         pca_input = plom_dict['scaling']['training']
         plom_dict['pca']['_input_source'] = 'scaling'
 
 ## PCA / PCA Whitening
     if pca_opt:
         if pca_whiten_opt:
-            # Full-rank whitening for Option A using standard PCA with all dimensions
-            if attn_opt:
-                X = plom_dict['attn']['training']
-            else:
-                X = plom_dict['scaling']['training']
+            # Full-rank whitening for Option B (or any mode with pca_whiten=True)
+            # Always applied to scaled data, never to attention-preconditioned data
+            X = plom_dict['scaling']['training']
             
             # Use standard _pca() with pca_dim = n_features (full rank)
             # This gives full-rank whitening equivalent to PCA whitening
@@ -2454,7 +2780,7 @@ def run(plom_dict):
             plom_dict['pca']['eigvals'] = eigvals
             plom_dict['pca']['eigvals_trunc'] = eigvals_trunc
         else:
-            # Standard PCA
+            # Standard PCA (Option A)
             pca(plom_dict)
 
 ## DMAPS
@@ -2481,8 +2807,9 @@ def run(plom_dict):
         else:
             inverse_pca(plom_dict)
 
-## Inverse attention preconditioning
-    if attn_opt:
+## Inverse attention preconditioning (Option A only)
+    if attn_opt and not pca_whiten_opt:
+        # Option A: Inverse attention preconditioning in band space
         inverse_attn_precondition(plom_dict)
 
 ## Inverse scaling
