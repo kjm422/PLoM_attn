@@ -1,0 +1,27 @@
+Job Summary
+-----------
+Job: Option A Standard PCA Test
+
+Training data dimensions: (100, 20)
+
+Scaling
+Used 'RobustIQR' method for scaling.
+
+PCA
+Used Cumulative Energy Content criteria for PCA.
+PCA features reduction: 20 -> 20
+
+DMAPS
+Input epsilon: auto
+Used epsilon: 123.56
+DMAPS eigenvalues: [0.01678948 0.01677315 0.01670632 0.0166336  0.01662926 0.01656677
+ 0.01654631 0.01652367 0.01651013 0.016473   0.01645116 0.01642597
+ 0.01636693 0.01634618 0.0163225  0.01625429 0.01624376 0.01618351
+ 0.01609575 0.01597688] [0.0017 ...]
+Manifold dimension = 20
+Used 20 eigenvectors for projection.
+Projected data (Z) dimensions: (100, 20)
+
+Sampling
+Generated 3 samples.
+Augmented data dimensions: (300, 20)

@@ -842,114 +842,6 @@ def inverse_attn_precondition(plom_dict):
         plom_dict['scaling']['augmented'] = X
 
 ###############################################################################
-def _pca_whiten(X, verbose=True):
-    """
-    PCA whitening (full-rank whitening) of data.
-    
-    Performs eigendecomposition of empirical covariance, and returns whitened
-    data such that the whitened covariance is identity. For r = n_features,
-    this includes all variance information.
-    
-    Parameters
-    ----------
-    X : ndarray of shape (n_samples, n_features)
-        Input data to whiten.
-    
-    verbose : bool, optional
-        If True, print relevant information. The default is True.
-
-    Returns
-    -------
-    eta_d : ndarray of shape (n_samples, n_features)
-        Whitened data: eta_d = X @ Phi @ Lambda^{-1/2}.
-    
-    Phi_r : ndarray of shape (n_features, n_features)
-        Eigenvectors of the covariance matrix (full rank).
-    
-    Lambda_r : ndarray of shape (n_features,)
-        Eigenvalues of the covariance matrix (full rank).
-    
-    mean : ndarray of shape (n_features,)
-        Mean of the input data.
-
-    """
-    if verbose:
-        print("\n\nPCA whitening (full-rank).")
-        print("------------------------")
-        print("Input data dimensions:", X.shape)
-    
-    # Center the data
-    mean = np.mean(X, axis=0)
-    X_centered = X - mean
-    
-    # Compute covariance matrix
-    C = np.cov(X_centered.T)
-    
-    # Eigendecomposition: C = Phi @ Lambda @ Phi^T
-    Lambda, Phi = np.linalg.eigh(C)
-    
-    # Sort by eigenvalues in descending order
-    idx = np.argsort(Lambda)[::-1]
-    Lambda = Lambda[idx]
-    Phi = Phi[:, idx]
-    
-    # For full rank, keep all components
-    n_features = X.shape[1]
-    Phi_r = Phi[:, :n_features]
-    Lambda_r = Lambda[:n_features]
-    
-    # Whiten: eta_d = (X - mean) @ Phi @ Lambda^{-1/2}
-    Lambda_r_inv_sqrt = 1.0 / np.sqrt(Lambda_r + 1e-10)  # Add small epsilon for numerical stability
-    eta_d = X_centered @ Phi_r @ np.diag(Lambda_r_inv_sqrt)
-    
-    if verbose:
-        print("Output (whitened) dimensions:", eta_d.shape)
-        print(f"Eigenvalue range: [{Lambda_r[-1]:.6e}, {Lambda_r[0]:.6e}]")
-        print("PCA whitening complete.")
-    
-    return eta_d, Phi_r, Lambda_r, mean
-
-###############################################################################
-def _inverse_pca_whiten(eta_d, Phi_r, Lambda_r, mean, verbose=True):
-    """
-    Inverse of PCA whitening.
-    
-    Given whitened data eta_d and the transformation parameters, recover
-    the original (unwhitened) data.
-
-    Parameters
-    ----------
-    eta_d : ndarray of shape (n_samples, n_features)
-        Whitened data.
-    
-    Phi_r : ndarray of shape (n_features, n_features)
-        Eigenvectors matrix.
-    
-    Lambda_r : ndarray of shape (n_features,)
-        Eigenvalues.
-    
-    mean : ndarray of shape (n_features,)
-        Mean of the original data.
-    
-    verbose : bool, optional
-        If True, print relevant information. The default is True.
-
-    Returns
-    -------
-    X : ndarray of shape (n_samples, n_features)
-        Recovered (unwhitened) data.
-
-    """
-    # Reverse whitening: X_centered = eta_d @ Lambda_r^{1/2} @ Phi_r^T
-    Lambda_r_sqrt = np.sqrt(Lambda_r + 1e-10)
-    X_centered = eta_d @ np.diag(Lambda_r_sqrt) @ Phi_r.T
-    
-    # Uncenter
-    X = X_centered + mean
-    
-    return X
-
-###############################################################################
 def _sample_projection(H, g):
     """
     Reduce normalized data (n_samples x nu) to random matrix [Z] (nu x m) 
@@ -2526,18 +2418,26 @@ def run(plom_dict):
 ## PCA / PCA Whitening
     if pca_opt:
         if pca_whiten_opt:
-            # Full-rank whitening for Option A
+            # Full-rank whitening for Option A using standard PCA with all dimensions
             if attn_opt:
                 X = plom_dict['attn']['training']
             else:
                 X = plom_dict['scaling']['training']
             
-            eta_d, Phi_r, Lambda_r, mean = _pca_whiten(X, verbose)
-            plom_dict['pca']['training'] = eta_d
-            plom_dict['pca']['evecs'] = Phi_r
-            plom_dict['pca']['eigvals'] = Lambda_r
+            # Use standard _pca() with pca_dim = n_features (full rank)
+            # This gives full-rank whitening equivalent to PCA whitening
+            n_features = X.shape[1]
+            X_pca, scaled_evecs_inv, scaled_evecs, evecs, mean, eigvals, eigvals_trunc = _pca(
+                X, method='pca_dim', pca_dim=n_features, scale_evecs=True, verbose=verbose
+            )
+            
+            plom_dict['pca']['training'] = X_pca
+            plom_dict['pca']['scaled_evecs_inv'] = scaled_evecs_inv
+            plom_dict['pca']['scaled_evecs'] = scaled_evecs
+            plom_dict['pca']['evecs'] = evecs
             plom_dict['pca']['mean'] = mean
-            plom_dict['pca']['eigvals_trunc'] = Lambda_r
+            plom_dict['pca']['eigvals'] = eigvals
+            plom_dict['pca']['eigvals_trunc'] = eigvals_trunc
         else:
             # Standard PCA
             pca(plom_dict)
@@ -2561,26 +2461,8 @@ def run(plom_dict):
 ## Inverse PCA / PCA Whitening
     if pca_opt:
         if pca_whiten_opt:
-            # Inverse whitening for Option A
-            eta_d_reconst = plom_dict['pca']['reconst_training']
-            eta_d_augment = plom_dict['pca']['augmented']
-            Phi_r = plom_dict['pca']['evecs']
-            Lambda_r = plom_dict['pca']['eigvals']
-            mean = plom_dict['pca']['mean']
-            
-            if eta_d_reconst is not None:
-                X_reconst = _inverse_pca_whiten(eta_d_reconst, Phi_r, Lambda_r, mean, verbose)
-                if attn_opt:
-                    plom_dict['attn']['reconst_training'] = X_reconst
-                else:
-                    plom_dict['scaling']['reconst_training'] = X_reconst
-            
-            if eta_d_augment is not None:
-                X_augment = _inverse_pca_whiten(eta_d_augment, Phi_r, Lambda_r, mean, verbose)
-                if attn_opt:
-                    plom_dict['attn']['augmented'] = X_augment
-                else:
-                    plom_dict['scaling']['augmented'] = X_augment
+            # Inverse for full-rank whitening using standard inverse_pca logic
+            inverse_pca(plom_dict)
         else:
             inverse_pca(plom_dict)
 
