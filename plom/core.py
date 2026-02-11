@@ -107,6 +107,10 @@ class PLoM:
     
     # General
     ---------
+    integer_columns : list or None, default=None
+        List of column indices (0-based) to round and convert to integers in X_new.
+        If None, no columns are converted to integers.
+    
     n_jobs : int, default=-1
         Number of parallel jobs for sampling. -1 uses all available processors.
     
@@ -149,6 +153,7 @@ class PLoM:
                  ito_potential_method: str = 'auto',
                  
                  # General
+                 integer_columns: Optional[List[int]] = None,
                  n_jobs: int = 1,
                  verbose: int = 1,
                  random_state: Optional[int] = None):
@@ -160,6 +165,7 @@ class PLoM:
         self.use_dmaps = use_dmaps
         self.projection_source = projection_source
         self.projection_target = projection_target
+        self.integer_columns = integer_columns if integer_columns is not None else []
         self.verbose = int(verbose)
         self.random_state = random_state
         
@@ -410,6 +416,15 @@ class PLoM:
             X_generated.append(current_rec)
             
         final_output = np.vstack(X_generated)
+        
+        # Convert specified columns to integers
+        if self.integer_columns:
+            for col_idx in self.integer_columns:
+                if 0 <= col_idx < final_output.shape[1]:
+                    final_output[:, col_idx] = np.round(final_output[:, col_idx]).astype(int)
+                else:
+                    if self.verbose >= 1:
+                        print(f"   > Warning: integer_columns index {col_idx} out of range (0-{final_output.shape[1]-1})")
         
         if self.verbose >= 1:
             print(f"   > Generated {final_output.shape[0]} points")
